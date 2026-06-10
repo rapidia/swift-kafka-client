@@ -571,6 +571,24 @@ public final class RDKafkaClient: Sendable {
         return message
     }
 
+    /// Request a new message or partition EOF event from the Kafka cluster.
+    func streamLensConsumerPoll(for pollTimeoutMs: Int32 = 0) throws -> KafkaStreamLensPollEvent? {
+        guard let messagePointer = rd_kafka_consumer_poll(self.kafkaHandle.pointer, pollTimeoutMs) else {
+            return nil
+        }
+
+        defer {
+            rd_kafka_message_destroy(messagePointer)
+        }
+
+        if messagePointer.pointee.err == RD_KAFKA_RESP_ERR__PARTITION_EOF {
+            return .partitionEOF(KafkaPartition(rawValue: Int(messagePointer.pointee.partition)))
+        }
+
+        let message = try KafkaConsumerMessage(messagePointer: messagePointer)
+        return .message(message)
+    }
+
     /// Subscribe to topic set using balanced consumer groups.
     /// - Parameter topicPartitionList: Pointer to a list of topics + partition pairs.
     func subscribe(topicPartitionList: RDKafkaTopicPartitionList) throws {
@@ -621,6 +639,22 @@ public final class RDKafkaClient: Sendable {
                 throw KafkaError.rdKafkaError(wrapping: result)
             }
         }
+    }
+
+    /// Atomic assignment of topic partitions with explicit offsets.
+    func streamLensAssign(topicPartitionOffsets: [KafkaTopicPartitionOffset]) throws {
+        let assignment = RDKafkaTopicPartitionList(size: Int32(topicPartitionOffsets.count))
+        for tpo in topicPartitionOffsets {
+            guard let offset = tpo.offset else {
+                throw KafkaError.config(reason: "Assignment requires a non-nil offset for \(tpo.topic):\(tpo.partition)")
+            }
+            assignment.setOffset(
+                topic: tpo.topic,
+                partition: tpo.partition,
+                offset: Int64(offset.rawValue)
+            )
+        }
+        try self.assign(topicPartitionList: assignment)
     }
 
     /// Pause consumption for the given partitions.
@@ -958,6 +992,158 @@ public final class RDKafkaClient: Sendable {
 
         return tpl.withListPointer { listPointer in
             Self.extractOffsetsFromList(listPointer)
+        }
+    }
+
+    /// Retrieve topic metadata from the broker.
+    func streamLensTopics(timeoutMilliseconds: Int32) async throws -> [KafkaStreamLensTopicMetadata] {
+        let kafkaHandle = self.kafkaHandle
+        return try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<[KafkaStreamLensTopicMetadata], Error>) in
+            Self.blockingQueue.async {
+                var metadataPointer: UnsafePointer<rd_kafka_metadata>?
+                let error = rd_kafka_metadata(
+                    kafkaHandle.pointer,
+                    1,
+                    nil,
+                    &metadataPointer,
+                    timeoutMilliseconds
+                )
+
+                guard error == RD_KAFKA_RESP_ERR_NO_ERROR else {
+                    continuation.resume(throwing: KafkaError.rdKafkaError(wrapping: error))
+                    return
+                }
+                guard let metadataPointer else {
+                    continuation.resume(returning: [])
+                    return
+                }
+                defer {
+                    rd_kafka_metadata_destroy(metadataPointer)
+                }
+
+                let metadata = metadataPointer.pointee
+                var topics: [KafkaStreamLensTopicMetadata] = []
+                topics.reserveCapacity(Int(metadata.topic_cnt))
+
+                for topicIndex in 0..<Int(metadata.topic_cnt) {
+                    let topicMetadata = metadata.topics[topicIndex]
+                    guard topicMetadata.err == RD_KAFKA_RESP_ERR_NO_ERROR,
+                          let topicNamePointer = topicMetadata.topic
+                    else {
+                        continue
+                    }
+
+                    var partitions: [KafkaPartition] = []
+                    partitions.reserveCapacity(Int(topicMetadata.partition_cnt))
+                    for partitionIndex in 0..<Int(topicMetadata.partition_cnt) {
+                        let partitionMetadata = topicMetadata.partitions[partitionIndex]
+                        guard partitionMetadata.err == RD_KAFKA_RESP_ERR_NO_ERROR else {
+                            continue
+                        }
+                        partitions.append(KafkaPartition(rawValue: Int(partitionMetadata.id)))
+                    }
+
+                    topics.append(
+                        KafkaStreamLensTopicMetadata(
+                            name: String(cString: topicNamePointer),
+                            partitions: partitions.sorted { $0.rawValue < $1.rawValue }
+                        )
+                    )
+                }
+
+                continuation.resume(
+                    returning: topics.sorted {
+                        $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+                    }
+                )
+            }
+        }
+    }
+
+    /// Retrieve low/high watermark offsets for topic partitions.
+    func streamLensWatermarkOffsets(
+        topicPartitions: [KafkaTopicPartition],
+        timeoutMilliseconds: Int32
+    ) async throws -> [KafkaStreamLensWatermarkOffsets] {
+        let kafkaHandle = self.kafkaHandle
+        return try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<[KafkaStreamLensWatermarkOffsets], Error>) in
+            Self.blockingQueue.async {
+                do {
+                    var watermarks: [KafkaStreamLensWatermarkOffsets] = []
+                    watermarks.reserveCapacity(topicPartitions.count)
+
+                    for topicPartition in topicPartitions {
+                        var low: Int64 = 0
+                        var high: Int64 = 0
+                        let error = rd_kafka_query_watermark_offsets(
+                            kafkaHandle.pointer,
+                            topicPartition.topic,
+                            Int32(topicPartition.partition.rawValue),
+                            &low,
+                            &high,
+                            timeoutMilliseconds
+                        )
+                        guard error == RD_KAFKA_RESP_ERR_NO_ERROR else {
+                            throw KafkaError.rdKafkaError(wrapping: error)
+                        }
+                        watermarks.append(
+                            KafkaStreamLensWatermarkOffsets(
+                                topic: topicPartition.topic,
+                                partition: topicPartition.partition,
+                                lowOffset: KafkaOffset(rawValue: Int(low)),
+                                highOffset: KafkaOffset(rawValue: Int(high))
+                            )
+                        )
+                    }
+
+                    continuation.resume(returning: watermarks)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    /// Retrieve offsets for timestamps using `rd_kafka_offsets_for_times`.
+    func offsetsForTimes(
+        topicPartitionTimestamps: [KafkaTopicPartitionOffset],
+        timeoutMilliseconds: Int32
+    ) async throws -> [KafkaTopicPartitionOffset] {
+        let tpl = RDKafkaTopicPartitionList(size: Int32(topicPartitionTimestamps.count))
+        for tpo in topicPartitionTimestamps {
+            guard let timestamp = tpo.offset else {
+                throw KafkaError.config(reason: "offsetsForTimes requires a timestamp offset for \(tpo.topic):\(tpo.partition)")
+            }
+            tpl.setOffset(
+                topic: tpo.topic,
+                partition: tpo.partition,
+                offset: Int64(timestamp.rawValue)
+            )
+        }
+
+        let kafkaHandle = self.kafkaHandle
+        return try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<[KafkaTopicPartitionOffset], Error>) in
+            Self.blockingQueue.async {
+                let error = tpl.withListPointer { listPointer in
+                    rd_kafka_offsets_for_times(
+                        kafkaHandle.pointer,
+                        listPointer,
+                        timeoutMilliseconds
+                    )
+                }
+
+                if error != RD_KAFKA_RESP_ERR_NO_ERROR {
+                    continuation.resume(throwing: KafkaError.rdKafkaError(wrapping: error))
+                } else {
+                    let results = tpl.withListPointer { listPointer in
+                        Self.extractOffsetsFromList(listPointer)
+                    }
+                    continuation.resume(returning: results)
+                }
+            }
         }
     }
 

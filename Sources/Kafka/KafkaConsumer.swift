@@ -878,6 +878,93 @@ public final class KafkaConsumer: Sendable, Service {
         }
     }
 
+    /// Retrieve topic metadata from the broker.
+    public func streamLensTopics(
+        timeout: Duration = .milliseconds(5000)
+    ) async throws -> [KafkaStreamLensTopicMetadata] {
+        let action = self.stateMachine.withLockedValue { $0.withClientForSubscription() }
+        switch action {
+        case .throwClosedError:
+            throw KafkaError.connectionClosed(reason: "Tried to query metadata on a closed consumer")
+        case .client(let client):
+            return try await client.streamLensTopics(timeoutMilliseconds: Int32(timeout.inMilliseconds))
+        }
+    }
+
+    /// Retrieve partition IDs for a single topic.
+    public func streamLensPartitions(
+        for topic: String,
+        timeout: Duration = .milliseconds(5000)
+    ) async throws -> [KafkaPartition] {
+        guard let metadata = try await self.streamLensTopics(timeout: timeout).first(where: { $0.name == topic }) else {
+            return []
+        }
+        return metadata.partitions
+    }
+
+    /// Retrieve low/high watermark offsets for topic partitions.
+    public func streamLensWatermarkOffsets(
+        topicPartitions: [KafkaTopicPartition],
+        timeout: Duration = .milliseconds(5000)
+    ) async throws -> [KafkaStreamLensWatermarkOffsets] {
+        let action = self.stateMachine.withLockedValue { $0.withClientForSubscription() }
+        switch action {
+        case .throwClosedError:
+            throw KafkaError.connectionClosed(reason: "Tried to query watermarks on a closed consumer")
+        case .client(let client):
+            return try await client.streamLensWatermarkOffsets(
+                topicPartitions: topicPartitions,
+                timeoutMilliseconds: Int32(timeout.inMilliseconds)
+            )
+        }
+    }
+
+    /// Retrieve offsets for timestamps for the given topic+partition pairs.
+    ///
+    /// The `offset` field of each input ``KafkaTopicPartitionOffset`` is interpreted
+    /// as a Unix timestamp in milliseconds.
+    public func offsetsForTimes(
+        topicPartitionTimestamps: [KafkaTopicPartitionOffset],
+        timeout: Duration = .milliseconds(5000)
+    ) async throws -> [KafkaTopicPartitionOffset] {
+        let action = self.stateMachine.withLockedValue { $0.withClientForSubscription() }
+        switch action {
+        case .throwClosedError:
+            throw KafkaError.connectionClosed(reason: "Tried to resolve offsets for timestamps on a closed consumer")
+        case .client(let client):
+            return try await client.offsetsForTimes(
+                topicPartitionTimestamps: topicPartitionTimestamps,
+                timeoutMilliseconds: Int32(timeout.inMilliseconds)
+            )
+        }
+    }
+
+    /// Atomically assign this consumer to multiple topic partitions.
+    public func streamLensAssign(
+        topicPartitionOffsets: [KafkaTopicPartitionOffset]
+    ) async throws {
+        let action = self.stateMachine.withLockedValue { $0.transitionToRunningIfNeeded() }
+        switch action {
+        case .consumerClosed:
+            throw KafkaError.connectionClosed(reason: "Consumer deinitialized before assignment")
+        case .setUpConnection(let client):
+            try client.streamLensAssign(topicPartitionOffsets: topicPartitionOffsets)
+        }
+    }
+
+    /// Poll one message or partition EOF event.
+    public func streamLensPoll(
+        timeout: Duration = .milliseconds(250)
+    ) async throws -> KafkaStreamLensPollEvent? {
+        let action = self.stateMachine.withLockedValue { $0.withClient() }
+        switch action {
+        case .throwClosedError:
+            throw KafkaError.connectionClosed(reason: "Tried to poll on a closed consumer")
+        case .client(let client):
+            return try client.streamLensConsumerPoll(for: Int32(timeout.inMilliseconds))
+        }
+    }
+
     /// This function is used to gracefully shut down a Kafka consumer client.
     ///
     /// - Note: Invoking this function is not always needed as the ``KafkaConsumer``
@@ -1081,6 +1168,25 @@ extension KafkaConsumer {
                 return .setUpConnection(client: client)
             case .running:
                 fatalError("\(#function) should not be invoked more than once")
+            case .finishing, .finishedAwaitingGracefulShutdown:
+                fatalError("\(#function) should only be invoked when KafkaConsumer is running")
+            case .finished:
+                return .consumerClosed
+            }
+        }
+
+        /// Transition to `.running` if needed and return the underlying client.
+        ///
+        /// This is used by manual assignment APIs that may be called before `run()`.
+        mutating func transitionToRunningIfNeeded() -> SetUpConnectionAction {
+            switch self.state {
+            case .uninitialized:
+                fatalError("\(#function) invoked while still in state \(self.state)")
+            case .initializing(let client, let rebalanceContext):
+                self.state = .running(client: client, rebalanceContext: rebalanceContext)
+                return .setUpConnection(client: client)
+            case .running(let client, _):
+                return .setUpConnection(client: client)
             case .finishing, .finishedAwaitingGracefulShutdown:
                 fatalError("\(#function) should only be invoked when KafkaConsumer is running")
             case .finished:
